@@ -1,4 +1,6 @@
-# main.py — Railway/本地通用，支持跨天下班 + 扣除报备重叠时长
+# main.py — Railway/本地通用
+# 功能：上班/下班指令流；跨天结算；按“实际报备用时(end_ts)”精确扣减
+
 import os
 import time
 import sqlite3
@@ -22,7 +24,7 @@ log = logging.getLogger("tg-bot")
 # ========= 基础配置 =========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TZ = timezone(timedelta(hours=7))  # 你的工作时区（UTC+7）
-CHECKIN_DEADLINE = os.getenv("CHECKIN_DEADLINE", "15:00:00").strip()  # 上班“准时”阈值
+CHECKIN_DEADLINE = os.getenv("CHECKIN_DEADLINE", "15:00:00").strip()  # 上班“准时”阈值（仅标记，不限制）
 DB_PATH = "db.sqlite3"
 
 # ========= 报备关键字（分钟）=========
@@ -92,7 +94,8 @@ def db_init():
             minutes INTEGER NOT NULL,
             start_ts INTEGER NOT NULL,
             due_ts INTEGER NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('ongoing','returned')) DEFAULT 'ongoing'
+            status TEXT NOT NULL CHECK(status IN ('ongoing','returned')) DEFAULT 'ongoing',
+            end_ts INTEGER
         )
         """
     )
@@ -116,7 +119,9 @@ def db_init():
     conn.commit()
     conn.close()
 
+    # 自愈缺失列（兼容历史数据库）
     ensure_checkins_columns()
+    ensure_reports_columns()
 
 def ensure_checkins_columns():
     conn = db_conn()
@@ -132,6 +137,17 @@ def ensure_checkins_columns():
     for col, decl in need.items():
         if col not in cols:
             c.execute(f"ALTER TABLE checkins ADD COLUMN {col} {decl}")
+    conn.commit()
+    conn.close()
+
+def ensure_reports_columns():
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(reports)")
+    cols = {row["name"] for row in c.fetchall()}
+    # 确保 end_ts 存在（用于记录“实际归队时间”）
+    if "end_ts" not in cols:
+        c.execute("ALTER TABLE reports ADD COLUMN end_ts INTEGER")
     conn.commit()
     conn.close()
 
@@ -159,8 +175,8 @@ def create_report(chat_id: int, user_id: int, username: str, keyword: str, minut
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO reports (chat_id, user_id, username, keyword, minutes, start_ts, due_ts, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'ongoing')
+        INSERT INTO reports (chat_id, user_id, username, keyword, minutes, start_ts, due_ts, status, end_ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'ongoing', NULL)
         """,
         (chat_id, user_id, username or "", keyword, minutes, now_ts, due_ts),
     )
@@ -170,67 +186,66 @@ def create_report(chat_id: int, user_id: int, username: str, keyword: str, minut
     return rid
 
 def finish_report(report_id: int):
+    now_ts = int(time.time())  # 记录“实际归队时间”
     conn = db_conn()
     c = conn.cursor()
-    c.execute("UPDATE reports SET status='returned' WHERE id=?", (report_id,))
+    c.execute(
+        "UPDATE reports SET status='returned', end_ts=? WHERE id=?",
+        (now_ts, report_id),
+    )
     conn.commit()
     conn.close()
 
 # ========= 上下班 =========
 async def do_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """收到 上班/打卡/到岗 -> 若已上班则提示；否则直接进入上班状态（不看时间）"""
     user = update.effective_message.from_user
     chat_id = update.effective_chat.id
 
     now = now_local()
     now_str = fmt_hms(now)
-    date_str = now.strftime("%Y-%m-%d")
-    log.info("[checkin] uid=%s now=%s deadline=%s", user.id, now_str, CHECKIN_DEADLINE)
 
     try:
         conn = db_conn()
         c = conn.cursor()
 
-        # 可选：防止有未结算的上班记录
+        # 是否已有“未结算”的上班记录
         c.execute(
-            "SELECT 1 FROM checkins WHERE chat_id=? AND user_id=? AND end_ts IS NULL",
+            "SELECT start_ts FROM checkins WHERE chat_id=? AND user_id=? AND end_ts IS NULL",
             (chat_id, user.id),
         )
-        if c.fetchone():
-            await update.effective_message.reply_text("检测到你还有一次上班未下班，请先发送“下班”完成结算。")
+        row = c.fetchone()
+        if row:
+            await update.effective_message.reply_text(f"你已在上班状态。（上次上班时间：{fmt_dt(int(row['start_ts']))}）")
             return
 
-        # 当天是否已打卡
+        # 没有则新开一条（date 用当天，仅展示用；跨天不受影响）
+        is_late = 1 if fmt_hms(now) > CHECKIN_DEADLINE else 0  # 仅标记
         c.execute(
-            "SELECT 1 FROM checkins WHERE chat_id=? AND user_id=? AND date=?",
-            (chat_id, user.id, date_str),
+            "INSERT INTO checkins(chat_id,user_id,username,date,start_ts,end_ts,work_seconds,is_late) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                chat_id,
+                user.id,
+                user.full_name,
+                now.strftime("%Y-%m-%d"),
+                int(time.time()),
+                None,
+                0,
+                is_late,
+            ),
         )
-        if c.fetchone():
-            await update.effective_message.reply_text(
-                f"{user.first_name} 今天已经打过卡了！（时间：{now_str}）"
-            )
-        else:
-            is_late = 1 if now_str > CHECKIN_DEADLINE else 0  # 字符串 HH:MM:SS 可直接比较
-            c.execute(
-                "INSERT INTO checkins(chat_id,user_id,username,date,start_ts,end_ts,work_seconds,is_late) VALUES (?,?,?,?,?,?,?,?)",
-                (chat_id, user.id, user.full_name, date_str, int(time.time()), None, 0, is_late),
-            )
-            conn.commit()
-            if is_late:
-                await update.effective_message.reply_text(f"❌ 迟到！（时间：{now_str}）")
-            else:
-                await update.effective_message.reply_text(
-                    f"✅ 打卡成功！又是新的一天祝你工作顺利入金不断！加油加油加油！（时间：{now_str}）"
-                )
+        conn.commit()
+        await update.effective_message.reply_text(f"✅ 已上班（时间：{now_str}）")
+
     finally:
         conn.close()
 
 async def do_offwork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    下班结算：
-    1) 找“未结算”的上班记录（end_ts IS NULL），跨天也能对上；
-    2) 计算 [start_ts, now_ts) 总时长；
-    3) 精确扣除报备（进行中 + 已归队）在该区间内的“交集秒数”，得到净工作时长；
-    4) 写回 end_ts & work_seconds。
+    收到 下班 -> 直接把当前这次上班结算（找 end_ts IS NULL 的最后一条），
+    净时长 = (now - start_ts) - 期间所有报备（进行中 + 已归队）的“实际重叠秒数”
+    （已归队按 end_ts 扣；未归队按 min(due_ts, now_ts) 扣）
     """
     user = update.effective_message.from_user
     chat_id = update.effective_chat.id
@@ -242,7 +257,7 @@ async def do_offwork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = db_conn()
         c = conn.cursor()
 
-        # 1) 找未结算的上班记录
+        # 1) 找未结算的上班记录（跨天也能对上）
         c.execute(
             """
             SELECT date, start_ts
@@ -254,19 +269,19 @@ async def do_offwork(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (chat_id, user.id),
         )
         row = c.fetchone()
-        if not row or not row["start_ts"]:
-            await update.effective_message.reply_text("还没有找到本次上班记录（可能未打上班卡或已结算）。")
+        if not row:
+            await update.effective_message.reply_text("还没有上班记录，无法下班哦。")
             return
 
         start_ts = int(row["start_ts"])
         start_date = row["date"]
 
-        # 2) 统计报备的交叠秒数（进行中 + 已归队），仅扣重叠部分
+        # 2) 统计报备的交叠秒数（进行中 + 已归队），按“实际用时”扣
         c.execute(
             """
-            SELECT start_ts, due_ts
+            SELECT start_ts, due_ts, status, end_ts
             FROM reports
-            WHERE chat_id=? AND user_id=? AND (status='ongoing' OR status='returned')
+            WHERE chat_id=? AND user_id=?
               AND due_ts > ? AND start_ts < ?
             """,
             (chat_id, user.id, start_ts, now_ts),
@@ -276,14 +291,17 @@ async def do_offwork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_overlap_sec = 0
         for rr in report_rows:
             r_start = int(rr["start_ts"])
-            r_end = int(rr["due_ts"])
+            if rr["status"] == "returned" and rr["end_ts"]:
+                r_end = int(rr["end_ts"])  # 实际归队时间
+            else:
+                r_end = min(int(rr["due_ts"]), now_ts)  # 未归队：最多扣到 now_ts
             report_overlap_sec += overlap_seconds(start_ts, now_ts, r_start, r_end)
 
-        # 3) 净工作时长
+        # 3) 计算净工作时长
         gross_seconds = max(0, now_ts - start_ts)
         net_seconds = max(0, gross_seconds - report_overlap_sec)
 
-        # 4) 写回
+        # 4) 写回结算
         c.execute(
             """
             UPDATE checkins
@@ -294,15 +312,14 @@ async def do_offwork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
-        msg = (
-            f"今日工作已结束。\n"
-            f"上班时间：{fmt_dt(start_ts)}\n"
-            f"下班时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        await update.effective_message.reply_text(
+            "今日工作已结束。\n"
+            f"上班：{fmt_dt(start_ts)}\n"
+            f"下班：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"总时长：{fmt_duration(gross_seconds)}\n"
             f"报备扣除：{fmt_duration(report_overlap_sec)}\n"
             f"净工作时长：{fmt_duration(net_seconds)}"
         )
-        await update.effective_message.reply_text(msg)
 
     finally:
         conn.close()
@@ -315,7 +332,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "下班：发送 “下班”（支持包含式）\n"
         f"迟到阈值：{CHECKIN_DEADLINE}\n"
         "报备关键字：wc小(5) / wc大(10) / 吃饭(30) / 抽烟(5) / 厕所(5)...\n"
-        "归队：发送 “1 / 回 / 回来了”（支持空格与大小写变体）"
+        "归队：发送 “1 / 回 / 回来了”（按实际用时扣除）\n"
+        "辅助：/whoami 查看你的 Telegram 用户ID"
     )
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,7 +369,7 @@ async def text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_offwork(update, context)
             return
 
-        # 3) 归队
+        # 3) 归队（记录实际 end_ts）
         if text_norm in {normalize_text(x) for x in RETURN_WORDS}:
             row = get_user_ongoing_report(chat_id, user.id)
             if not row:
@@ -359,7 +377,7 @@ async def text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             report_id, keyword, minutes, start_ts, due_ts = row
-            finish_report(report_id)
+            finish_report(report_id)  # 会写入 end_ts=当前时间
             used_sec = int(time.time()) - int(start_ts)
             used_str = fmt_duration(used_sec)
 
