@@ -1,4 +1,4 @@
-# main.py — with report overdue reminders + counters
+# main.py — with report overdue reminders + counters (fixed job_queue None)
 import os
 import time
 import sqlite3
@@ -83,7 +83,7 @@ def db_init():
             due_ts INTEGER NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('ongoing','returned')) DEFAULT 'ongoing',
             end_ts INTEGER,
-            alerted INTEGER DEFAULT 0   -- 已提醒/已计数
+            alerted INTEGER DEFAULT 0
         )
     """)
 
@@ -106,7 +106,7 @@ def db_init():
             chat_id INTEGER,
             user_id INTEGER,
             late_count INTEGER DEFAULT 0,
-            overdue_count INTEGER DEFAULT 0,   -- 报备超时累计
+            overdue_count INTEGER DEFAULT 0,
             PRIMARY KEY(chat_id, user_id)
         )
     """)
@@ -359,17 +359,13 @@ async def send_overdue_alert(context: ContextTypes.DEFAULT_TYPE):
         if to_int(r["alerted"], 0) == 1:
             conn.close(); return
 
-        # 到点未归队 → 提醒 + 计数 + 标记 alerted
         await context.bot.send_message(
             chat_id=r["chat_id"],
             text=f"⚠️ {r['username']} 的报备“{r['keyword']}”已到时间，请尽快归队！"
         )
-        # 加一次“超时次数”
         total = inc_overdue_count(r["chat_id"], r["user_id"])
-        # 标记已提醒/已计数
         c.execute("UPDATE reports SET alerted=1 WHERE id=?", (rid,))
         conn.commit()
-        # 可选：再告知累计次数
         await context.bot.send_message(
             chat_id=r["chat_id"],
             text=f"（累计报备超时：{total} 次）"
@@ -397,7 +393,6 @@ async def overdue_checker(app):
                     )
                 except Exception:
                     pass
-                # 计数 + 标记
                 total = inc_overdue_count(r["chat_id"], r["user_id"])
                 c.execute("UPDATE reports SET alerted=1 WHERE id=?", (r["id"],))
                 conn.commit()
@@ -411,7 +406,7 @@ async def overdue_checker(app):
             conn.close()
         except Exception:
             pass
-        await asyncio.sleep(60)  # 每 60 秒兜底检查一次
+        await asyncio.sleep(60)
 
 # ========= 指令 / 文本 =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,7 +424,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("ver: final-20250823-od")
+    await update.effective_message.reply_text("ver: final-20250823-od-fixjq")
 
 def is_checkin_text(t: str) -> bool:
     keys = ("上班", "打卡", "到岗")
@@ -458,10 +453,8 @@ async def text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rid, kw, mins, st, due, alerted = row
                 finish_report(rid)
                 used = int(time.time()) - to_int(st, 0)
-                # 若超时且未计数过（alerted==0），归队时补计一次
                 if int(time.time()) > to_int(due, 0) and to_int(alerted, 0) == 0:
                     total = inc_overdue_count(chat_id, user.id)
-                    # 标记已计数
                     conn = db_conn(); c = conn.cursor()
                     c.execute("UPDATE reports SET alerted=1 WHERE id=?", (rid,))
                     conn.commit(); conn.close()
@@ -491,13 +484,14 @@ async def text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.effective_message.reply_text(
                     f"已报备：{hit}（{mins} 分钟）。到点请回复 1 或“回”结束。"
                 )
-                # JobQueue 到点提醒
-                context.job_queue.run_once(
-                    send_overdue_alert,
-                    when=mins*60,
-                    data={"report_id": rid},
-                    name=f"report_{rid}",
-                )
+                # ✅ JobQueue 可能为 None，先判断
+                if context.job_queue:
+                    context.job_queue.run_once(
+                        send_overdue_alert,
+                        when=mins*60,
+                        data={"report_id": rid},
+                        name=f"report_{rid}",
+                    )
             return
 
     except Exception as e:
@@ -509,14 +503,13 @@ async def on_startup(app):
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    # 启动兜底轮询
     asyncio.create_task(overdue_checker(app))
 
 def main():
     if not BOT_TOKEN:
         print("❌ 请设置 BOT_TOKEN"); return
     db_init()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()  # PTB v20+ 会包含 job_queue
     app.post_init = on_startup
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ver", ver_cmd))
