@@ -16,7 +16,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TZ = timezone(timedelta(hours=7))
 CHECKIN_DEADLINE = os.getenv("CHECKIN_DEADLINE", "15:00:00").strip()
-RESET_HOURS = int(os.getenv("RESET_HOURS", "12"))
+RESET_HOURS = int(os.getenv("RESET_HOURS", "14"))
 DB_PATH = "db.sqlite3"
 
 REPORT_MAP = {
